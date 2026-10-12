@@ -1,0 +1,100 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use IO::Socket::IP;
+use IO::Select;
+use Socket qw(SOCK_STREAM SO_ERROR);
+use Time::HiRes qw(time sleep);
+use Getopt::Long qw(GetOptions);
+
+my ($cnt, $itv, $tmo, $js) = (5, 1, 3, 0);
+GetOptions('c=i' => \$cnt, 'i=f' => \$itv, 't=f' => \$tmo, 'json' => \$js) or die "bad opts\n";
+die "usage: vso-tcpping [-c N] [-i SEC] [-t SEC] [--json] host:port ...\n" unless @ARGV;
+die "c must be 1-1000\n" unless $cnt >= 1 && $cnt <= 1000;
+die "i must be 0.1-60\n" unless $itv >= 0.1 && $itv <= 60;
+die "t must be 0.2-30\n" unless $tmo >= 0.2 && $tmo <= 30;
+die "too many targets\n" if @ARGV > 256;
+
+my @tg;
+for my $arg (@ARGV) {
+    die "bad target: $arg\n" unless $arg =~ /\A(\[[0-9A-Fa-f:]{2,45}\]|[A-Za-z0-9][A-Za-z0-9.\-]{0,251}):(\d{1,5})\z/;
+    my ($hst, $prt) = ($1, $2);
+    die "bad port: $arg\n" if $prt < 1 || $prt > 65535;
+    $hst =~ s/\A\[|\]\z//g;
+    push @tg, { hst => $hst, prt => $prt, rt => [], lo => 0 };
+}
+
+for my $n (1 .. $cnt) {
+    my $sel = IO::Select->new;
+    my %pnd;
+    my $t0 = time;
+    for my $i (0 .. $#tg) {
+        my $s = IO::Socket::IP->new(
+            PeerHost => $tg[$i]{hst},
+            PeerPort => $tg[$i]{prt},
+            Type     => SOCK_STREAM,
+            Blocking => 0,
+        );
+        if (!$s) { $tg[$i]{lo}++; next }
+        $pnd{fileno $s} = [$i, $s, time];
+        $sel->add($s);
+    }
+    while ($sel->count && time - $t0 < $tmo) {
+        for my $s ($sel->can_write(0.05)) {
+            my $fd = fileno $s;
+            my $ent = delete $pnd{$fd};
+            my $err = $s->sockopt(SO_ERROR);
+            $sel->remove($s);
+            if ($err) { $tg[$ent->[0]]{lo}++ }
+            else { push @{ $tg[$ent->[0]]{rt} }, (time - $ent->[2]) * 1000 }
+            close $s;
+        }
+    }
+    for my $fd (keys %pnd) {
+        $tg[$pnd{$fd}[0]]{lo}++;
+        close $pnd{$fd}[1];
+    }
+    sleep $itv if $n < $cnt;
+}
+
+my @out;
+for my $t (@tg) {
+    my @rt = sort { $a <=> $b } @{ $t->{rt} };
+    my $ok = scalar @rt;
+    my $tot = $ok + $t->{lo};
+    my ($mn, $mx, $av, $jt) = (0, 0, 0, 0);
+    if ($ok) {
+        $mn = $rt[0];
+        $mx = $rt[-1];
+        $av = 0; $av += $_ for @rt; $av /= $ok;
+        my @raw = @{ $t->{rt} };
+        if (@raw > 1) {
+            my $sm = 0;
+            $sm += abs($raw[$_] - $raw[$_ - 1]) for 1 .. $#raw;
+            $jt = $sm / $#raw;
+        }
+    }
+    push @out, {
+        tgt  => "$t->{hst}:$t->{prt}",
+        sent => $tot,
+        ok   => $ok,
+        loss => $tot ? sprintf('%.1f', 100 * $t->{lo} / $tot) + 0 : 100,
+        min  => sprintf('%.2f', $mn) + 0,
+        avg  => sprintf('%.2f', $av) + 0,
+        max  => sprintf('%.2f', $mx) + 0,
+        jit  => sprintf('%.2f', $jt) + 0,
+    };
+}
+
+if ($js) {
+    my @rows = map {
+        my $o = $_;
+        '{' . join(',', map { my $v = $o->{$_}; $v =~ /\A-?[0-9.]+\z/ ? "\"$_\":$v" : "\"$_\":\"$v\"" } qw(tgt sent ok loss min avg max jit)) . '}'
+    } @out;
+    print '[' . join(',', @rows) . "]\n";
+} else {
+    printf "%-34s %5s %5s %7s %8s %8s %8s %7s\n", qw(target sent ok loss% min avg max jit);
+    printf "%-34s %5d %5d %7s %8.2f %8.2f %8.2f %7.2f\n", @{$_}{qw(tgt sent ok loss min avg max jit)} for @out;
+}
+my $dn = grep { $_->{ok} == 0 } @out;
+exit($dn ? 1 : 0);
